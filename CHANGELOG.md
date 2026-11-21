@@ -45,6 +45,9 @@
   by reading spans lazily.
 - Greatly reduced peak memory usage of exports using `util.export.gather_annotations()` (such as the XML exports) for
   large source files, by making the element hierarchy calculation more memory efficient.
+- `xml_export:pretty` now streams the XML to file instead of building the whole document in memory, which reduces
+  memory usage for large source files from tens of gigabytes to under one gigabyte. The output is unchanged; in the
+  rare cases where identical output can't be guaranteed while streaming, the previous in-memory export is used.
 - CWB exports now normalize annotation names to valid CWB identifiers and report collisions after normalization.
 - Removed SenSALDO sentiment and Blingbring annotations from the default Swedish preset. They can still be selected
   explicitly.
