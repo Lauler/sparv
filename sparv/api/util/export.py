@@ -9,7 +9,7 @@ from array import array
 from collections import OrderedDict, defaultdict, deque
 from collections.abc import Callable, Iterable, Iterator, Sequence
 from copy import deepcopy
-from itertools import combinations
+from itertools import combinations, islice
 from typing import Any, ClassVar, Literal, TypeVar, cast, overload
 
 from sparv.api import (
@@ -465,14 +465,18 @@ class SpanStream:
         """Return the attribute annotations (or header contents) per element, in `annotation_dict` order."""
         return self._value_sources
 
-    def non_empty_elements(self) -> list[tuple[str, bool, int]]:
-        """Return (name, is_header, number of spans) for every span annotation with at least one span."""
-        result = []
-        for base_name, annotation, is_header in self.span_annotations:
-            count = sum(1 for _ in annotation.read_spans(decimals=True))
-            if count:
-                result.append((base_name, is_header, count))
-        return result
+    @staticmethod
+    def count_spans(annotation: Annotation, limit: int | None = None) -> int:
+        """Count the spans of a span annotation, reading at most `limit` spans.
+
+        Args:
+            annotation: The span annotation.
+            limit: Stop counting after this many spans (e.g. 1 to check whether there are any spans).
+
+        Returns:
+            The number of spans (at most `limit`).
+        """
+        return sum(1 for _ in islice(annotation.read_spans(decimals=True), limit))
 
     def record_overlap_ids(self) -> dict[tuple, int]:
         """Run through all events once and return the final overlap ID of every span that gets one.
