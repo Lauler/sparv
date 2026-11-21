@@ -9,6 +9,8 @@
   installed.
 - Added `sparv dev inspect` command for inspecting files in the sparv-workdir.
 - Add support for scrambled plain text export, using the `text_export:scrambled` annotator.
+- Added the `segment.token_cache` setting, which makes the default tokenizer several times faster by caching how each
+  word is tokenized. It is disabled by default.
 
 ### Changed
 
