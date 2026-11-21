@@ -17,6 +17,8 @@
   upgrading Sparv and running `sparv setup` again.
 - Reduced memory usage when writing annotations, by streaming values to file in chunks instead of materializing and
   converting the whole list first.
+- Reduced memory usage of `get_children()`, `get_parents()`, `get_child_values()` and `read_parents_and_children()`
+  by reading spans lazily.
 - JSON logging no longer logs the last log message using the custom log level `FINAL`, but instead uses the standard
   `INFO`, `WARNING` or `ERROR` log levels, with an additional field `"event": "final"`.
 
