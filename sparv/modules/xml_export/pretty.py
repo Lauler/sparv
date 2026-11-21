@@ -94,7 +94,8 @@ def pretty(
     xml_utils.replace_invalid_chars_in_names(export_names)
 
     # Stream the XML to file, which uses little memory even for very large source files. If that isn't possible with a
-    # guaranteed identical result, build the whole XML tree in memory instead.
+    # guaranteed identical result (including for invalid input, where the error is reported by the code below), build
+    # the whole XML tree in memory instead. Other errors are not caught, so that problems aren't hidden.
     try:
         xml_utils.write_pretty_xml(
             out_path,
@@ -109,8 +110,13 @@ def pretty(
             sparv_namespace,
             xml_namespaces,
         )
-    except Exception as e:  # noqa: BLE001
-        logger.info("Streaming XML export not possible (%s: %s), building XML in memory", type(e).__name__, e)
+    except util.export.StreamingNotPossibleError as e:
+        logger.warning(
+            "Could not stream the XML export for '%s' (%s). Building the XML in memory instead, which uses a lot more "
+            "memory for large source files.",
+            source_file,
+            e,
+        )
         word_annotation = list(word.read())
         span_positions, annotation_dict = util.export.gather_annotations(
             annotation_list, export_names, h_annotations, source_file=source_file, split_overlaps=True
