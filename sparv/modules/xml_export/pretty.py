@@ -69,8 +69,7 @@ def pretty(
 
     token_name = token.name
 
-    # Read words, file ID and XML namespaces
-    word_annotation = list(word.read())
+    # Read file ID and XML namespaces
     fileid_annotation = fileid.read()
     xml_namespaces = Namespaces(source_file).read()
 
@@ -93,24 +92,44 @@ def pretty(
     h_annotations, h_export_names = util.export.get_header_names(header_annotations, xml_namespaces)
     export_names.update(h_export_names)
     xml_utils.replace_invalid_chars_in_names(export_names)
-    span_positions, annotation_dict = util.export.gather_annotations(
-        annotation_list, export_names, h_annotations, source_file=source_file, split_overlaps=True
-    )
-    xmlstr = xml_utils.make_pretty_xml(
-        span_positions,
-        annotation_dict,
-        export_names,
-        token_name,
-        word_annotation,
-        fileid_annotation,
-        include_empty_attributes,
-        sparv_namespace,
-        xml_namespaces,
-    )
 
-    # Write XML to file
-    with out_path.open(mode="w", encoding="utf-8") as outfile:
-        print(xmlstr, file=outfile)  # Use print() to get a newline at the end of the file
+    # Stream the XML to file, which uses little memory even for very large source files. If that isn't possible with a
+    # guaranteed identical result, build the whole XML tree in memory instead.
+    try:
+        xml_utils.write_pretty_xml(
+            out_path,
+            annotation_list,
+            export_names,
+            h_annotations,
+            source_file,
+            token_name,
+            word,
+            fileid_annotation,
+            include_empty_attributes,
+            sparv_namespace,
+            xml_namespaces,
+        )
+    except Exception as e:  # noqa: BLE001
+        logger.info("Streaming XML export not possible (%s: %s), building XML in memory", type(e).__name__, e)
+        word_annotation = list(word.read())
+        span_positions, annotation_dict = util.export.gather_annotations(
+            annotation_list, export_names, h_annotations, source_file=source_file, split_overlaps=True
+        )
+        xmlstr = xml_utils.make_pretty_xml(
+            span_positions,
+            annotation_dict,
+            export_names,
+            token_name,
+            word_annotation,
+            fileid_annotation,
+            include_empty_attributes,
+            sparv_namespace,
+            xml_namespaces,
+        )
+
+        # Write XML to file
+        with out_path.open(mode="w", encoding="utf-8") as outfile:
+            print(xmlstr, file=outfile)  # Use print() to get a newline at the end of the file
     logger.info("Exported: %s", out)
 
 

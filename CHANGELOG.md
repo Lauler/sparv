@@ -21,6 +21,9 @@
   by reading spans lazily.
 - Greatly reduced peak memory usage of exports using `util.export.gather_annotations()` (such as the XML exports) for
   large source files, by making the element hierarchy calculation more memory efficient.
+- `xml_export:pretty` now streams the XML to file instead of building the whole document in memory, which reduces
+  memory usage for large source files from tens of gigabytes to under one gigabyte. The output is unchanged; in the
+  rare cases where identical output can't be guaranteed while streaming, the previous in-memory export is used.
 - JSON logging no longer logs the last log message using the custom log level `FINAL`, but instead uses the standard
   `INFO`, `WARNING` or `ERROR` log levels, with an additional field `"event": "final"`.
 
