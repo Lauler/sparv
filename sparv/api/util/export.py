@@ -6,7 +6,7 @@ import re
 import xml.etree.ElementTree as etree  # noqa: N813
 from array import array
 from collections import OrderedDict, defaultdict
-from collections.abc import Iterable, Sequence
+from collections.abc import Callable, Iterable, Sequence
 from copy import deepcopy
 from itertools import combinations
 from typing import Any, ClassVar, Literal, TypeVar, cast, overload
@@ -261,24 +261,7 @@ def gather_annotations(
     # Add position information to sorted_spans
     spans_dict: defaultdict[int, list[tuple[str, Span]]] = defaultdict(list)
     for span in sorted_spans:
-        # Treat empty spans differently
-        if span.start == span.end:
-            insert_index = len(spans_dict[span.start])
-            if span.name in Span.elem_hierarchy:
-                for i, (instruction, s) in enumerate(spans_dict[span.start]):
-                    if (
-                        instruction == "close"
-                        and s.name in Span.elem_hierarchy[span.name]
-                        and Span.elem_hierarchy[span.name][s.name] == 1
-                    ):
-                        insert_index = i
-                        break
-            spans_dict[span.start].insert(insert_index, ("open", span))
-            spans_dict[span.end].insert(insert_index + 1, ("close", span))
-        else:
-            # Append opening spans; prepend closing spans
-            spans_dict[span.start].append(("open", span))
-            spans_dict[span.end].insert(0, ("close", span))
+        _add_span_events(spans_dict, span)
 
     # Should overlapping spans be split?
     if split_overlaps:
@@ -293,6 +276,35 @@ def gather_annotations(
     return span_positions, annotation_dict
 
 
+def _add_span_events(spans_dict: defaultdict[int, list[tuple[str, Span]]], span: Span) -> None:
+    """Add the open and close events of a span to `spans_dict`.
+
+    Spans must be added in sorted order.
+
+    Args:
+        spans_dict: A dictionary mapping span positions to the spans that open and close at those positions.
+        span: The span to add.
+    """
+    # Treat empty spans differently
+    if span.start == span.end:
+        insert_index = len(spans_dict[span.start])
+        if span.name in Span.elem_hierarchy:
+            for i, (instruction, s) in enumerate(spans_dict[span.start]):
+                if (
+                    instruction == "close"
+                    and s.name in Span.elem_hierarchy[span.name]
+                    and Span.elem_hierarchy[span.name][s.name] == 1
+                ):
+                    insert_index = i
+                    break
+        spans_dict[span.start].insert(insert_index, ("open", span))
+        spans_dict[span.end].insert(insert_index + 1, ("close", span))
+    else:
+        # Append opening spans; prepend closing spans
+        spans_dict[span.start].append(("open", span))
+        spans_dict[span.end].insert(0, ("close", span))
+
+
 def _handle_overlaps(spans_dict: dict[int, list[tuple[str, Span]]]) -> None:
     """Handle overlapping spans by splitting them and assigning unique IDs to maintain their original relationships.
 
@@ -302,9 +314,28 @@ def _handle_overlaps(spans_dict: dict[int, list[tuple[str, Span]]]) -> None:
     Args:
         spans_dict: A dictionary mapping span positions to the spans that open and close at those positions.
     """
-    span_stack = []
-    overlap_count = 0
+    handler = _OverlapHandler()
     for position in sorted(spans_dict):
+        handler.handle_position(spans_dict, position)
+
+
+class _OverlapHandler:
+    """Split overlapping spans, one position at a time (in increasing order)."""
+
+    def __init__(self) -> None:
+        self.span_stack: list[Span] = []
+        self.overlap_count = 0
+
+    def handle_position(self, spans_dict: dict[int, list[tuple[str, Span]]], position: int) -> None:
+        """Handle overlapping spans at `position`.
+
+        Only `spans_dict[position]` and the lists of positions where currently open spans end are modified.
+
+        Args:
+            spans_dict: A dictionary mapping span positions to the spans that open and close at those positions.
+            position: The position to handle.
+        """
+        span_stack = self.span_stack
         subposition_shift = 0
         for subposition, (event, span) in enumerate(spans_dict[position].copy()):
             if event == "open":
@@ -317,8 +348,8 @@ def _handle_overlaps(spans_dict: dict[int, list[tuple[str, Span]]]) -> None:
 
                     # Close all overlapping spans and add an overlap ID to them
                     while closing_span != span:
-                        overlap_count += 1
-                        closing_span.overlap_id = overlap_count
+                        self.overlap_count += 1
+                        closing_span.overlap_id = self.overlap_count
 
                         # Create a copy of this span, to be reopened after we close this one
                         new_span = deepcopy(closing_span)
@@ -346,6 +377,10 @@ def _handle_overlaps(spans_dict: dict[int, list[tuple[str, Span]]]) -> None:
 
 
 _SET_LOOKUP_MAX = 5_000_000  # Max number of keys to put in a temporary set when comparing two elements
+# Limits for packing a (start, end) position pair into one signed 64-bit integer: (start << 32) | end
+_PACK_START_LIMIT = 2**31
+_PACK_END_LIMIT = 2**32
+_PACK_END_MASK = 2**32 - 1
 
 
 def _share_any_key(span_keys: dict[str, array | list], keys_sorted: dict[str, bool], a: str, b: str) -> bool:
@@ -403,33 +438,56 @@ def calculate_element_hierarchy(source_file: str | None, spans_list: list[Span])
     Raises:
         SparvErrorMessage: If span collisions require hierarchy resolution and `source_file` is missing.
     """
+    return _calculate_element_hierarchy(
+        source_file, lambda: ((s.name, s.start, s.end, s.start_sub, s.end_sub) for s in spans_list)
+    )
+
+
+def _calculate_element_hierarchy(
+    source_file: str | None, get_spans: Callable[[], Iterable[tuple[str, int, int, Any, Any]]]
+) -> dict[str, dict[str, int]]:
+    """Calculate the hierarchy for spans with identical start and end positions.
+
+    See `calculate_element_hierarchy()`. This version takes a function returning a fresh iterable of
+    `(name, start, end, start_sub, end_sub)` tuples, so that spans don't need to be kept in memory.
+
+    Args:
+        source_file: The source filename.
+        get_spans: A function returning an iterable of span tuples. It may be called more than once.
+
+    Returns:
+        A dictionary with the hierarchy of spans.
+
+    Raises:
+        SparvErrorMessage: If span collisions require hierarchy resolution and `source_file` is missing.
+    """
     # This function used to keep a dict entry with a set for every span and every span boundary, which for large source
     # files (tens of millions of tokens) required tens of gigabytes of memory. The implementation below computes exactly
     # the same relation pairs using compact per-element arrays instead.
 
-    # Collect the (start, end) positions of every element, packed into a single integer per span. We don't include
-    # sub-positions here as we still need to compare spans with sub-positions with spans without.
-    max_pos = min_pos = 0
-    for span in spans_list:
-        max_pos = max(max_pos, span.start, span.end)
-        min_pos = min(min_pos, span.start, span.end)
-    base = max_pos + 1
-    # Packed keys must be unique and fit in a signed 64-bit integer; otherwise fall back to (start, end) tuples
-    use_packed = min_pos >= 0 and base * base < 2**63
+    # Collect the (start, end) positions of every element, packed into a single integer per span (as long as positions
+    # are small enough, otherwise (start, end) tuples are used). We don't include sub-positions here as we still need to
+    # compare spans with sub-positions with spans without.
+    use_packed = True
     span_keys: dict[str, array | list] = {}
     keys_sorted: dict[str, bool] = {}
     empty_span_starts = defaultdict(set)
-    for span in spans_list:
-        key = span.start * base + span.end if use_packed else (span.start, span.end)
-        keys = span_keys.get(span.name)
+    for name, start, end, start_sub, end_sub in get_spans():
+        if use_packed and not (0 <= start < _PACK_START_LIMIT and 0 <= end < _PACK_END_LIMIT):
+            # Switch all elements over to tuple keys
+            use_packed = False
+            for n, keys in span_keys.items():
+                span_keys[n] = [(k >> 32, k & _PACK_END_MASK) for k in keys]
+        key = (start << 32) | end if use_packed else (start, end)
+        keys = span_keys.get(name)
         if keys is None:
-            keys = span_keys[span.name] = array("q") if use_packed else []
-            keys_sorted[span.name] = True
-        elif keys_sorted[span.name] and key < keys[-1]:
-            keys_sorted[span.name] = False
+            keys = span_keys[name] = array("q") if use_packed else []
+            keys_sorted[name] = True
+        elif keys_sorted[name] and key < keys[-1]:
+            keys_sorted[name] = False
         keys.append(key)
-        if (span.start, span.start_sub) == (span.end, span.end_sub):
-            empty_span_starts[span.name].add(span.start)
+        if (start, start_sub) == (end, end_sub):
+            empty_span_starts[name].add(start)
 
     # Find pairs of elements with identical spans
     relation_pairs = set()
@@ -442,12 +500,12 @@ def calculate_element_hierarchy(source_file: str | None, spans_list: list[Span])
     if empty_span_starts:
         empty_positions = set().union(*empty_span_starts.values())
         startend_positions = defaultdict(set)
-        for span in spans_list:
-            if (span.start, span.start_sub) != (span.end, span.end_sub):
-                if span.start in empty_positions:
-                    startend_positions[span.start].add(span.name)
-                if span.end in empty_positions:
-                    startend_positions[span.end].add(span.name)
+        for name, start, end, start_sub, end_sub in get_spans():
+            if (start, start_sub) != (end, end_sub):
+                if start in empty_positions:
+                    startend_positions[start].add(name)
+                if end in empty_positions:
+                    startend_positions[end].add(name)
         for empty_span, span_starts in empty_span_starts.items():
             for span_start in span_starts:
                 relation_pairs.update(tuple(sorted((empty_span, a))) for a in startend_positions.get(span_start, ()))
