@@ -197,6 +197,7 @@ def write_pretty_xml(
 
     Raises:
         StreamingNotPossibleError: If the XML can't be streamed with a guaranteed identical result.
+        LateOverlapError: If overlap IDs are still assigned too late after they have been collected (not expected).
     """
     stream = util.export.SpanStream(
         annotation_list, export_names, header_annotations, source_file=source_file, split_overlaps=True
@@ -207,24 +208,21 @@ def write_pretty_xml(
 
     tmp_path = out_path.with_name(f"{out_path.name}.tmp")
     try:
-        try:
-            events = stream.events()
-            with tmp_path.open(mode="w", encoding="utf-8") as outfile:
-                _write_pretty_xml_events(
-                    outfile.write, events, stream.annotation_dict(), export_names, token_name,
-                    util.export.SequentialValues(word.read()), fileid, include_empty_attributes, sparv_namespace,
-                    qnames, namespaces,
-                )  # fmt: skip
-        except util.export.LateOverlapError:
-            # Overlap IDs were found after the affected elements were written; get all IDs first and start over
-            overlap_ids = stream.record_overlap_ids()
-            events = stream.events(overlap_ids=overlap_ids)
-            with tmp_path.open(mode="w", encoding="utf-8") as outfile:
-                _write_pretty_xml_events(
-                    outfile.write, events, stream.annotation_dict(), export_names, token_name,
-                    util.export.SequentialValues(word.read()), fileid, include_empty_attributes, sparv_namespace,
-                    qnames, namespaces,
-                )  # fmt: skip
+        overlap_ids = None
+        while True:
+            try:
+                with tmp_path.open(mode="w", encoding="utf-8") as outfile:
+                    _write_pretty_xml_events(
+                        outfile.write, stream.events(overlap_ids=overlap_ids), stream.annotation_dict(), export_names,
+                        token_name, util.export.SequentialValues(word.read()), fileid, include_empty_attributes,
+                        sparv_namespace, qnames, namespaces,
+                    )  # fmt: skip
+                break
+            except util.export.LateOverlapError:
+                if overlap_ids is not None:
+                    raise
+                # Overlap IDs were found after the affected elements were written; get all IDs first and start over
+                overlap_ids = stream.record_overlap_ids()
         tmp_path.replace(out_path)
     finally:
         tmp_path.unlink(missing_ok=True)
@@ -274,9 +272,13 @@ def _streaming_qnames(
     used_tags = set()
     used_attrs = set()
     sources = stream.attribute_annotations()
-    for name, is_header, count in stream.non_empty_elements():
-        used_tags.add(export_names.get(name, name))
+    for name, annotation, is_header in stream.span_annotations:
+        tag = export_names.get(name, name)
         if is_header:
+            # Headers are included as XML, which may contain namespaced names
+            count = stream.count_spans(annotation)
+            if count:
+                used_tags.add(tag)
             for header_contents in sources[name][util.constants.HEADER_CONTENTS][:count]:
                 header = re.sub(r"^\t+", lambda m: INDENTATION * len(m.group()), header_contents, flags=re.MULTILINE)
                 header_xml = etree.fromstring(header)
@@ -284,13 +286,21 @@ def _streaming_qnames(
                     if i:  # The root element is renamed
                         used_tags.add(elem.tag)
                     used_attrs.update(elem.keys())
-        else:
-            for attrib_name, source in sources[name].items():
-                export_name = export_names.get(f"{name}:{attrib_name}", attrib_name)
-                if export_name[:1] != "{":
-                    continue  # Names without namespace don't affect the namespace declarations
-                if include_empty_attributes or any(source.read()):
-                    used_attrs.add(export_name)
+            continue
+
+        # Names without namespace don't affect the namespace declarations, so only namespaced names need checking
+        namespaced_attrs = []
+        for attrib_name, source in sources[name].items():
+            export_name = export_names.get(f"{name}:{attrib_name}", attrib_name)
+            if export_name[:1] == "{":
+                namespaced_attrs.append((export_name, source))
+        if (tag[:1] != "{" and not namespaced_attrs) or not stream.count_spans(annotation, limit=1):
+            continue
+        used_tags.add(tag)
+        for export_name, source in namespaced_attrs:
+            values = source if isinstance(source, list) else source.read()
+            if include_empty_attributes or any(values):
+                used_attrs.add(export_name)
 
     dummy = etree.Element("_")
     for tag in used_tags:
