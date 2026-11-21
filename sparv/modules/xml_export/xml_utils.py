@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import bz2
+import functools
 import re
 import typing as t
 import xml.etree.ElementTree as etree  # noqa: N813
@@ -199,6 +200,8 @@ def write_pretty_xml(
         StreamingNotPossibleError: If the XML can't be streamed with a guaranteed identical result.
         LateOverlapError: If overlap IDs are still assigned too late after they have been collected (not expected).
     """
+    if not _etree_internals_work():
+        raise util.export.StreamingNotPossibleError("ElementTree internals not compatible with this Python version")
     stream = util.export.SpanStream(
         annotation_list, export_names, header_annotations, source_file=source_file, split_overlaps=True
     )
@@ -226,6 +229,31 @@ def write_pretty_xml(
         tmp_path.replace(out_path)
     finally:
         tmp_path.unlink(missing_ok=True)
+
+
+@functools.cache
+def _etree_internals_work() -> bool:
+    """Check that the private ElementTree functions used for streaming exist and behave like the public API.
+
+    Returns:
+        True if streaming can use the ElementTree internals.
+    """
+    try:
+        root = etree.Element("r", {"k": 'v"&<\n'})
+        root.text = "t&"
+        child = etree.SubElement(root, "{http://www.w3.org/1999/xhtml}c")
+        child.tail = "x>"
+        etree.SubElement(root, "e")
+        qnames, namespaces = etree._namespaces(root)
+        parts = []
+        etree._serialize_xml(parts.append, root, qnames, namespaces, short_empty_elements=True)
+        return (
+            "".join(parts) == etree.tostring(root, encoding="unicode")
+            and etree._escape_cdata("&<>") == "&amp;&lt;&gt;"
+            and isinstance(etree._namespace_map, dict)
+        )
+    except Exception:
+        return False
 
 
 class _QNames(dict):  # noqa: FURB189 (only item access is needed, which dict supports directly)
@@ -440,6 +468,9 @@ def _write_pretty_xml_events(
     last_item = first_item
 
     for item in span_positions:
+        if not node_stack:
+            # The root element is closed but there are more elements (make_pretty_xml() reports an invalid root)
+            raise util.export.StreamingNotPossibleError("Elements after the root element")
         last_item = item
         _pos, instruction, span = item
         # Handle headers

@@ -326,7 +326,7 @@ class SequentialValues:
             try:
                 buffer.append(next(self._iterator))
             except StopIteration:
-                raise IndexError(index) from None
+                raise IndexError("list index out of range") from None  # Same error as for a list
             if len(buffer) > self._window:
                 buffer.popleft()
                 self._first += 1
