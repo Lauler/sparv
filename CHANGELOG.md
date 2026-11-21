@@ -29,6 +29,8 @@
   warning is logged.
 - JSON logging no longer logs the last log message using the custom log level `FINAL`, but instead uses the standard
   `INFO`, `WARNING` or `ERROR` log levels, with an additional field `"event": "final"`.
+- Annotation files are now written with gzip compression level 6 instead of 9, which makes writing large
+  annotations much faster (up to 16 times for token spans) with practically the same file size.
 
 ### Fixed
 
