@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+import heapq
 import re
 import xml.etree.ElementTree as etree  # noqa: N813
 from array import array
-from collections import OrderedDict, defaultdict
-from collections.abc import Callable, Iterable, Sequence
+from collections import OrderedDict, defaultdict, deque
+from collections.abc import Callable, Iterable, Iterator, Sequence
 from copy import deepcopy
 from itertools import combinations
 from typing import Any, ClassVar, Literal, TypeVar, cast, overload
@@ -39,6 +40,7 @@ class Span:
     elem_hierarchy: ClassVar[dict[str, dict[str, int]]] = {}  # Set before sorting
 
     __slots__ = (
+        "copy_id",
         "end",
         "end_sub",
         "export",
@@ -71,6 +73,7 @@ class Span:
         self.is_header = is_header
         self.node = None
         self.overlap_id = None
+        self.copy_id = 0  # Distinguishes copies created when splitting overlapping spans
 
     def set_node(self, parent_node: etree.Element | None = None) -> None:
         """Create an XML node under parent_node.
@@ -276,6 +279,291 @@ def gather_annotations(
     return span_positions, annotation_dict
 
 
+class StreamingNotPossibleError(Exception):
+    """Raised when a streaming export can't guarantee the same result as the non-streaming implementation."""
+
+
+class LateOverlapError(StreamingNotPossibleError):
+    """Raised when an overlap ID is assigned to a span whose opening event has already been yielded."""
+
+
+class SequentialValues:
+    """Index-based access to annotation values that are read sequentially from disk.
+
+    Only a window of the most recently read values is kept in memory. Accessing a value before the window raises
+    `StreamingNotPossibleError`.
+    """
+
+    __slots__ = ("_buffer", "_first", "_iterator", "_window")
+
+    def __init__(self, values: Iterable, window: int = 10_000) -> None:
+        self._iterator = iter(values)
+        self._buffer: deque = deque()
+        self._first = 0
+        self._window = window
+
+    def __getitem__(self, index: int) -> Any:
+        buffer = self._buffer
+        while index >= self._first + len(buffer):
+            try:
+                buffer.append(next(self._iterator))
+            except StopIteration:
+                raise IndexError(index) from None
+            if len(buffer) > self._window:
+                buffer.popleft()
+                self._first += 1
+        if index < self._first:
+            raise StreamingNotPossibleError(f"Annotation value {index} is no longer in memory")
+        return buffer[index - self._first]
+
+
+_MAX_GROUP_CHECK = 64
+
+
+def _is_strict_weak_order(spans: list[Span]) -> bool:
+    """Check that `Span.__lt__` is a strict weak ordering on the given spans.
+
+    Only then is sorting the spans independently guaranteed to give the same relative order as sorting them together
+    with all other spans (which always have a different start position).
+
+    Args:
+        spans: Spans with the same start position.
+
+    Returns:
+        True if the ordering is a strict weak ordering (or if there is only one span).
+    """
+    n = len(spans)
+    if n < 2:  # noqa: PLR2004
+        return True
+    if n > _MAX_GROUP_CHECK:
+        return False
+    lt = [[a < b for b in spans] for a in spans]
+    indices = range(n)
+    for i in indices:
+        if lt[i][i]:
+            return False
+        for j in indices:
+            if lt[i][j] and lt[j][i]:
+                return False
+    if n > 2:  # noqa: PLR2004
+        for i in indices:
+            for j in indices:
+                for k in indices:
+                    if lt[i][j] and lt[j][k] and not lt[i][k]:
+                        return False
+                    incomparable_ij = not lt[i][j] and not lt[j][i]
+                    incomparable_jk = not lt[j][k] and not lt[k][j]
+                    if incomparable_ij and incomparable_jk and (lt[i][k] or lt[k][i]):
+                        return False
+    return True
+
+
+def _span_key(span: Span) -> tuple:
+    """Return a key identifying a span object, including copies created when splitting overlapping spans."""
+    return span.name, span.index, span.is_header, span.copy_id
+
+
+class SpanStream:
+    """Stream the span positions that `gather_annotations()` returns, without keeping all spans in memory.
+
+    The events (and the values from `annotation_dict()`) are exactly those of
+    `gather_annotations(..., flatten=True)`, provided that the iteration finishes without raising
+    `StreamingNotPossibleError`. Spans are read from disk and only the spans currently open are kept in memory.
+
+    Span annotation files must be sorted by start position (which is enforced when writing annotations).
+    """
+
+    def __init__(
+        self,
+        annotations: list[Annotation | AnnotationAllSourceFiles],
+        export_names: dict[str, str],
+        header_annotations: list[Annotation] | None,
+        source_file: str | None,
+        split_overlaps: bool = False,
+    ) -> None:
+        """Prepare the stream and calculate the element hierarchy.
+
+        Args:
+            annotations: List of annotations to include.
+            export_names: Dictionary that maps from annotation names to export names.
+            header_annotations: List of header annotations.
+            source_file: The source filename.
+            split_overlaps: Whether to split up overlapping spans.
+
+        Raises:
+            StreamingNotPossibleError: If the annotations can't be streamed.
+            SparvErrorMessage: If header contents can't be found.
+        """
+        if source_file is None:
+            raise StreamingNotPossibleError("source_file is required")
+        self.export_names = export_names
+        self.split_overlaps = split_overlaps
+
+        resolved_annotations: list[Annotation] = [
+            annotation(source_file) if isinstance(annotation, AnnotationAllSourceFiles) else annotation
+            for annotation in annotations
+        ]
+
+        # Mirror how gather_annotations() builds annotation_dict, but keep the annotation objects instead of values
+        self.span_annotations: list[tuple[str, Annotation, bool]] = []
+        self._value_sources: defaultdict[str, dict[str, Annotation | list]] = defaultdict(dict)
+        for annots, is_header in ((resolved_annotations, False), (header_annotations or [], True)):
+            for annotation in sorted(annots):
+                base_name, attr = annotation.split()
+                if not attr:
+                    self._value_sources[base_name] = {}
+                    self.span_annotations.append((base_name, annotation, is_header))
+                if attr and attr in self._value_sources[base_name]:
+                    raise StreamingNotPossibleError(f"Duplicate attribute annotation: {annotation}")
+                if attr:
+                    self._value_sources[base_name][attr] = annotation
+                elif is_header:
+                    try:
+                        self._value_sources[base_name][util.constants.HEADER_CONTENTS] = list(
+                            Annotation(f"{base_name}:{util.constants.HEADER_CONTENTS}", source_file=source_file).read()
+                        )
+                    except FileNotFoundError:
+                        raise SparvErrorMessage(
+                            f"Could not find data for XML header '{base_name}'. "
+                            "Was this element listed in 'xml_import.header_elements'?"
+                        ) from None
+        span_keys = [(base_name, is_header) for base_name, _, is_header in self.span_annotations]
+        if len(set(span_keys)) != len(span_keys):
+            raise StreamingNotPossibleError("Duplicate span annotations")
+
+        # Calculate hierarchy (if needed)
+        self.hierarchy = _calculate_element_hierarchy(source_file, self._span_tuples)
+        Span.elem_hierarchy = self.hierarchy
+
+    def _span_tuples(self) -> Iterator[tuple[str, int, int, Any, Any]]:
+        """Yield (name, start, end, start_sub, end_sub) for all spans, in the order of gather_annotations()."""
+        for base_name, annotation, _ in self.span_annotations:
+            for start, end in annotation.read_spans(decimals=True):
+                yield (
+                    base_name,
+                    start[0],
+                    end[0],
+                    start[1] if len(start) > 1 else False,
+                    end[1] if len(end) > 1 else False,
+                )
+
+    def annotation_dict(self) -> dict[str, dict[str, Any]]:
+        """Return a fresh `annotation_dict`, with attribute values read lazily from disk.
+
+        Returns:
+            A dictionary like the one returned by `gather_annotations()`.
+        """
+        return {
+            base_name: {
+                attr: source if isinstance(source, list) else SequentialValues(source.read())
+                for attr, source in sources.items()
+            }
+            for base_name, sources in self._value_sources.items()
+        }
+
+    def attribute_annotations(self) -> dict[str, dict[str, Annotation | list]]:
+        """Return the attribute annotations (or header contents) per element, in `annotation_dict` order."""
+        return self._value_sources
+
+    def non_empty_elements(self) -> list[tuple[str, bool, int]]:
+        """Return (name, is_header, number of spans) for every span annotation with at least one span."""
+        result = []
+        for base_name, annotation, is_header in self.span_annotations:
+            count = sum(1 for _ in annotation.read_spans(decimals=True))
+            if count:
+                result.append((base_name, is_header, count))
+        return result
+
+    def record_overlap_ids(self) -> dict[tuple, int]:
+        """Run through all events once and return the final overlap ID of every span that gets one.
+
+        Returns:
+            A dictionary mapping span keys to overlap IDs, to be passed to `events()`.
+        """
+        recorded: dict[tuple, int] = {}
+        for _ in self.events(record_overlap_ids=recorded):
+            pass
+        return recorded
+
+    def events(
+        self, overlap_ids: dict[tuple, int] | None = None, record_overlap_ids: dict[tuple, int] | None = None
+    ) -> Iterator[tuple[int, str, Span]]:
+        """Yield (position, instruction, span) tuples, like the flattened `span_positions` from gather_annotations().
+
+        Overlap IDs (when splitting overlaps) are assigned to spans when the overlap is found, which may be after the
+        span's opening event. Without `overlap_ids`, `LateOverlapError` is raised in that case. The caller can then
+        get the final IDs with `record_overlap_ids()` and pass them here, so that they are set before spans are yielded.
+
+        Args:
+            overlap_ids: Final overlap IDs from `record_overlap_ids()`.
+            record_overlap_ids: Dictionary to record overlap IDs in (used by `record_overlap_ids()`).
+
+        Yields:
+            Tuples of (position, instruction, span).
+
+        Raises:
+            StreamingNotPossibleError: If the spans can't be streamed with a guaranteed identical result.
+        """
+        export_names = self.export_names
+
+        def span_stream(base_name: str, annotation: Annotation, is_header: bool) -> Iterator[Span]:
+            for i, s in enumerate(annotation.read_spans(decimals=True)):
+                span = Span(base_name, i, s[0], s[1], export_names, is_header)
+                if overlap_ids:
+                    span.overlap_id = overlap_ids.get(_span_key(span))
+                yield span
+
+        merged = heapq.merge(*(span_stream(*a) for a in self.span_annotations), key=_span_start)
+        spans_dict: defaultdict[int, list[tuple[str, Span]]] = defaultdict(list)
+        overlap_handler = (
+            _OverlapHandler(
+                record=record_overlap_ids,
+                preset=overlap_ids,
+                fail_on_late_overlap=overlap_ids is None and record_overlap_ids is None,
+            )
+            if self.split_overlaps
+            else None
+        )
+        next_span = next(merged, None)
+        previous_position = None
+        while next_span is not None or spans_dict:
+            # The next position is either the start of the next span or the earliest pending position
+            position = next_span.start if next_span is not None else None
+            if spans_dict:
+                pending = min(spans_dict)
+                if position is None or pending < position:
+                    position = pending
+            if previous_position is not None and position <= previous_position:
+                raise StreamingNotPossibleError("Spans are not sorted by position")
+            previous_position = position
+
+            # Collect and sort all spans starting at this position. All spans with other start positions are ordered
+            # by their start positions alone, so this gives the same order as sorting all spans, as long as the
+            # ordering within the group is consistent.
+            group = []
+            while next_span is not None and next_span.start == position:
+                if next_span.end < next_span.start:
+                    raise StreamingNotPossibleError("Span ends before it starts")
+                group.append(next_span)
+                next_span = next(merged, None)
+            if len(group) > 1:
+                if not _is_strict_weak_order(group):
+                    raise StreamingNotPossibleError("Inconsistent span ordering")
+                group.sort()
+            for span in group:
+                _add_span_events(spans_dict, span)
+
+            # This position can't receive any more events, since all remaining spans start (and end) later
+            if overlap_handler is not None:
+                overlap_handler.handle_position(spans_dict, position)
+            for instruction, span in spans_dict.pop(position, ()):
+                yield position, instruction, span
+
+
+def _span_start(span: Span) -> int:
+    return span.start
+
+
 def _add_span_events(spans_dict: defaultdict[int, list[tuple[str, Span]]], span: Span) -> None:
     """Add the open and close events of a span to `spans_dict`.
 
@@ -320,11 +608,24 @@ def _handle_overlaps(spans_dict: dict[int, list[tuple[str, Span]]]) -> None:
 
 
 class _OverlapHandler:
-    """Split overlapping spans, one position at a time (in increasing order)."""
+    """Split overlapping spans, one position at a time (in increasing order).
 
-    def __init__(self) -> None:
+    The optional arguments are used when streaming (see `SpanStream.events()`): overlap IDs can be recorded, preset on
+    the copies of split spans, or an exception can be raised when a span that has already been yielded gets an ID.
+    """
+
+    def __init__(
+        self,
+        record: dict[tuple, int] | None = None,
+        preset: dict[tuple, int] | None = None,
+        fail_on_late_overlap: bool = False,
+    ) -> None:
         self.span_stack: list[Span] = []
         self.overlap_count = 0
+        self.record = record
+        self.preset = preset
+        self.fail_on_late_overlap = fail_on_late_overlap
+        self.copy_counts: defaultdict[tuple, int] = defaultdict(int)
 
     def handle_position(self, spans_dict: dict[int, list[tuple[str, Span]]], position: int) -> None:
         """Handle overlapping spans at `position`.
@@ -350,10 +651,20 @@ class _OverlapHandler:
                     while closing_span != span:
                         self.overlap_count += 1
                         closing_span.overlap_id = self.overlap_count
+                        if self.fail_on_late_overlap and closing_span.start < position:
+                            raise LateOverlapError("Overlap ID assigned after the span was opened")
+                        if self.record is not None:
+                            self.record[_span_key(closing_span)] = self.overlap_count
 
                         # Create a copy of this span, to be reopened after we close this one
                         new_span = deepcopy(closing_span)
                         new_span.start = span.end
+                        if self.record is not None or self.preset is not None:
+                            original_key = (closing_span.name, closing_span.index, closing_span.is_header)
+                            self.copy_counts[original_key] += 1
+                            new_span.copy_id = self.copy_counts[original_key]
+                            if self.preset is not None:
+                                new_span.overlap_id = self.preset.get(_span_key(new_span), new_span.overlap_id)
                         overlap_stack.append(new_span)
 
                         # Replace the original overlapping span with the new copy
