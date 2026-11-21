@@ -19,6 +19,8 @@
   converting the whole list first.
 - Reduced memory usage of `get_children()`, `get_parents()`, `get_child_values()` and `read_parents_and_children()`
   by reading spans lazily.
+- Greatly reduced peak memory usage of exports using `util.export.gather_annotations()` (such as the XML exports) for
+  large source files, by making the element hierarchy calculation more memory efficient.
 - JSON logging no longer logs the last log message using the custom log level `FINAL`, but instead uses the standard
   `INFO`, `WARNING` or `ERROR` log levels, with an additional field `"event": "final"`.
 
